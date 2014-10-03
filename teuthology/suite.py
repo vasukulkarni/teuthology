@@ -4,7 +4,6 @@
 
 import copy
 from datetime import datetime
-import itertools
 import logging
 import os
 import requests
@@ -13,10 +12,12 @@ import subprocess
 import smtplib
 import sys
 import yaml
+import math
 from email.mime.text import MIMEText
 from tempfile import NamedTemporaryFile
 
 import teuthology
+import matrix
 from . import lock
 from .config import config, JobConfig
 from .exceptions import BranchNotFoundError, ScheduleFailError
@@ -57,6 +58,10 @@ def main(args):
     timeout = args['--timeout']
     filter_in = args['--filter']
     filter_out = args['--filter-out']
+
+    subset = None
+    if args['--subset']:
+        subset = tuple(map(int, args['--subset'].split('/')))
 
     name = make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
                          machine_type)
@@ -101,6 +106,7 @@ def main(args):
                          verbose=verbose,
                          filter_in=filter_in,
                          filter_out=filter_out,
+                         subset=subset
                          )
     os.remove(base_yaml_path)
 
@@ -239,7 +245,9 @@ def create_initial_config(suite, suite_branch, ceph_branch, teuthology_branch,
 
 def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
                          num, timeout, dry_run, verbose,
-                         filter_in, filter_out):
+                         filter_in,
+                         filter_out,
+                         subset):
     """
     Puts together some "base arguments" with which to execute
     teuthology-schedule for each job, then passes them and other parameters to
@@ -280,6 +288,7 @@ def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
         dry_run=dry_run,
         filter_in=filter_in,
         filter_out=filter_out,
+        subset=subset
     )
 
     if job_config.email and num_jobs:
@@ -452,6 +461,7 @@ def schedule_suite(job_config,
                    dry_run=True,
                    filter_in=None,
                    filter_out=None,
+                   subset=None,
                    ):
     """
     schedule one suite.
@@ -459,8 +469,26 @@ def schedule_suite(job_config,
     """
     suite_name = job_config.suite
     log.debug('Suite %s in %s' % (suite_name, path))
+
+    mat = None
+    first = None
+    matlimit = None
+    if subset:
+        (index, outof) = subset
+        mat = build_matrix(path, mincyclicity=outof)
+        print mat.size()
+        first = (mat.size() / outof) * index
+        if index == outof or index == outof - 1:
+            matlimit = mat.size()
+        else:
+            matlimit = (mat.size() / outof) * (index + 1)
+    else:
+        first = 0
+        mat = build_matrix(path)
+        matlimit = mat.size()
+
     configs = [(combine_path(suite_name, item[0]), item[1]) for item in
-               build_matrix(path)]
+               generate_combinations(path, mat, first, matlimit)]
     log.info('Suite %s in %s generated %d jobs (not yet filtered)' % (
         suite_name, path, len(configs)))
 
@@ -670,8 +698,7 @@ def combine_path(left, right):
         return os.path.join(left, right)
     return left
 
-
-def build_matrix(path):
+def generate_combinations(path, mat, generate_from, generate_to):
     """
     Return a list of items describe by path
 
@@ -695,51 +722,82 @@ def build_matrix(path):
     component will appear as a file with braces listing the selection
     of chosen subitems.
     """
+    ret = []
+    for i in range(generate_from, generate_to):
+        output = mat.index(i)
+        ret.append((
+            matrix.generate_desc(combine_path, output),
+            matrix.generate_paths(path, output, combine_path)))
+    return ret
+
+def build_matrix(path, item='', mincyclicity=0):
+    """
+    Return a list of items descibed by path such that if the list of items is chunked
+    into mincyclicity pieces, each piece is still a good subset of the suite.
+
+    A good subset of a product ensures that each facet member appears at least once.
+    A good subset of a sum ensures that the subset of each sub collection reflected
+    in the subset is a good subset.
+
+    A mincyclicity of 0 does not attempt to enforce the good subset property.
+
+    The input is just a path.  The output is an array of (description,
+    [file list]) tuples.
+
+    For a normal file we generate a new item for the result list.
+
+    For a directory, we (recursively) generate a new item for each
+    file/dir.
+
+    For a directory with a magic '+' file, we generate a single item
+    that concatenates all files/subdirs (A Sum).
+
+    For a directory with a magic '%' file, we generate a result set
+    for each item in the directory, and then do a product to generate
+    a result list with all combinations (A Product).
+
+    The final description (after recursion) for each item will look
+    like a relative path.  If there was a % product, that path
+    component will appear as a file with braces listing the selection
+    of chosen subitems.
+    """
     if os.path.isfile(path):
         if path.endswith('.yaml'):
-            return [(None, [path])]
-        return []
+            return matrix.Base(item)
+        return None
     if os.path.isdir(path):
         files = sorted(os.listdir(path))
         if '+' in files:
             # concatenate items
             files.remove('+')
-            raw = []
-            for fn in files:
-                raw.extend(build_matrix(os.path.join(path, fn)))
-            out = [(
-                '{' + ' '.join(files) + '}',
-                [a[1][0] for a in raw]
-            )]
-            return out
+            submats = []
+            for fn in sorted(files):
+                submats.append(build_matrix(os.path.join(path, fn), fn))
+            return matrix.Product(item, submats)
         elif '%' in files:
             # convolve items
             files.remove('%')
-            sublists = []
-            for fn in files:
-                raw = build_matrix(os.path.join(path, fn))
-                if raw:
-                    sublists.append([(combine_path(fn, item[0]), item[1])
-                                     for item in raw])
-            out = []
-            if sublists:
-                for sublist in itertools.product(*sublists):
-                    name = '{' + ' '.join([item[0] for item in sublist]) + '}'
-                    val = []
-                    for item in sublist:
-                        val.extend(item[1])
-                    out.append((name, val))
-            return out
+            submats = []
+            for fn in sorted(files):
+                submat = build_matrix(os.path.join(path, fn), fn)
+                if submat:
+                    submats.append(submat)
+            return matrix.Product(item, submats)
         else:
             # list items
-            out = []
-            for fn in files:
-                raw = build_matrix(os.path.join(path, fn))
-                out.extend([(combine_path(fn, item[0]), item[1])
-                           for item in raw])
-            return out
-    return []
-
+            submats = []
+            for fn in sorted(files):
+                submat = build_matrix(os.path.join(path, fn), fn)
+                if submat is None:
+                    continue
+                if submat.cyclicity() < mincyclicity:
+                    submat = matrix.Cycle(
+                        int(math.ceil(
+                            mincyclicity / submat.cyclicity())),
+                        submat)
+                submats.append(submat)
+            return matrix.Sum(item, submats)
+    return None
 
 def get_arch(machine_type):
     """
