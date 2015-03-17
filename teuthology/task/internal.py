@@ -187,6 +187,10 @@ def check_lock(ctx, config):
         log.info('Lock checking disabled.')
         return
     log.info('Checking locks...')
+    """
+    short time disable locks for all machines
+    """
+    pass
     for machine in ctx.config['targets'].iterkeys():
         status = lockstatus.get_status(machine)
         log.debug('machine status is %s', repr(status))
